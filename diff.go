@@ -107,137 +107,211 @@ var hunkRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)
 // "--- / +++ / @@" diff with no "diff --git" headers. Unrecognized lines are
 // ignored, so a diff embedded in surrounding text still parses.
 func ParseDiff(diff string) ([]FileChange, error) {
-	var (
-		files []FileChange
-		cur   *FileChange
-		hunk  *Hunk
-		// Remaining old/new lines declared by the current hunk's "@@" header.
-		// They bound the hunk body, so trailing blank lines (e.g. the artifact
-		// of the diff's final newline) are not swallowed as context.
-		oldRem, newRem int
-	)
-	flush := func() {
-		if cur != nil {
-			files = append(files, *cur)
-		}
-		cur = nil
-		hunk = nil
-	}
-	newFile := func() *FileChange {
-		flush()
-		cur = &FileChange{Type: Modified}
-		return cur
-	}
-
+	var p diffParser
 	for _, line := range strings.Split(diff, "\n") {
-		switch {
-		case strings.HasPrefix(line, "diff --git "):
-			f := newFile()
-			f.OldPath, f.NewPath = pathsFromGitHeader(line)
-
-		case strings.HasPrefix(line, "new file mode "):
-			ensure(&cur, newFile).Type = Added
-			cur.NewMode = strings.TrimSpace(strings.TrimPrefix(line, "new file mode "))
-		case strings.HasPrefix(line, "deleted file mode "):
-			ensure(&cur, newFile).Type = Deleted
-			cur.OldMode = strings.TrimSpace(strings.TrimPrefix(line, "deleted file mode "))
-		case strings.HasPrefix(line, "old mode "):
-			ensure(&cur, newFile).OldMode = strings.TrimSpace(strings.TrimPrefix(line, "old mode "))
-		case strings.HasPrefix(line, "new mode "):
-			ensure(&cur, newFile).NewMode = strings.TrimSpace(strings.TrimPrefix(line, "new mode "))
-
-		case strings.HasPrefix(line, "rename from "):
-			f := ensure(&cur, newFile)
-			f.Type = Renamed
-			f.OldPath = unquotePath(strings.TrimPrefix(line, "rename from "))
-		case strings.HasPrefix(line, "rename to "):
-			f := ensure(&cur, newFile)
-			f.Type = Renamed
-			f.NewPath = unquotePath(strings.TrimPrefix(line, "rename to "))
-		case strings.HasPrefix(line, "copy from "):
-			f := ensure(&cur, newFile)
-			f.Type = Copied
-			f.OldPath = unquotePath(strings.TrimPrefix(line, "copy from "))
-		case strings.HasPrefix(line, "copy to "):
-			f := ensure(&cur, newFile)
-			f.Type = Copied
-			f.NewPath = unquotePath(strings.TrimPrefix(line, "copy to "))
-
-		case strings.HasPrefix(line, "Binary files ") || strings.HasPrefix(line, "GIT binary patch"):
-			ensure(&cur, newFile).IsBinary = true
-
-		case strings.HasPrefix(line, "--- "):
-			// A new "---" while the current file already has hunks starts the
-			// next file (handles plain diffs with no "diff --git" header).
-			if cur == nil || len(cur.Hunks) > 0 {
-				newFile()
-			}
-			hunk = nil
-			path, devnull := diffPath(line, "--- ")
-			cur.OldPath = path
-			if devnull {
-				cur.Type = Added
-			}
-		case strings.HasPrefix(line, "+++ "):
-			f := ensure(&cur, newFile)
-			path, devnull := diffPath(line, "+++ ")
-			f.NewPath = path
-			if devnull {
-				f.Type = Deleted
-			}
-
-		case strings.HasPrefix(line, "@@ "):
-			if m := hunkRe.FindStringSubmatch(line); m != nil {
-				f := ensure(&cur, newFile)
-				h := Hunk{
-					OldStart: atoi(m[1]),
-					OldLines: atoiDefault(m[2], 1),
-					NewStart: atoi(m[3]),
-					NewLines: atoiDefault(m[4], 1),
-					Section:  strings.TrimSpace(m[5]),
-				}
-				f.Hunks = append(f.Hunks, h)
-				hunk = &f.Hunks[len(f.Hunks)-1]
-				oldRem, newRem = h.OldLines, h.NewLines
-			}
-
-		default:
-			if hunk == nil || cur == nil {
-				continue
-			}
-			// Once the declared line counts are exhausted the hunk is over;
-			// anything after it (a blank line, the next commit's text) is not
-			// part of the diff.
-			if oldRem <= 0 && newRem <= 0 {
-				hunk = nil
-				continue
-			}
-			switch {
-			case strings.HasPrefix(line, "+"):
-				hunk.Lines = append(hunk.Lines, Line{Kind: Add, Text: line[1:]})
-				cur.Additions++
-				newRem--
-			case strings.HasPrefix(line, "-"):
-				hunk.Lines = append(hunk.Lines, Line{Kind: Delete, Text: line[1:]})
-				cur.Deletions++
-				oldRem--
-			case strings.HasPrefix(line, " "):
-				hunk.Lines = append(hunk.Lines, Line{Kind: Context, Text: line[1:]})
-				oldRem--
-				newRem--
-			case strings.HasPrefix(line, "\\"):
-				// "\ No newline at end of file" — not a content line.
-			case line == "":
-				// A blank line with its leading space stripped: still a
-				// context line while the hunk has lines left to consume.
-				hunk.Lines = append(hunk.Lines, Line{Kind: Context, Text: ""})
-				oldRem--
-				newRem--
-			}
-		}
+		p.consume(line)
 	}
-	flush()
-	return files, nil
+	p.flush()
+	return p.files, nil
+}
+
+// diffParser holds the running state while walking a diff line by line.
+type diffParser struct {
+	files []FileChange
+	cur   *FileChange
+	hunk  *Hunk
+	// oldRem/newRem are the old/new lines still expected in the current hunk,
+	// from its "@@" header. They bound the hunk body so trailing blank lines
+	// (e.g. the artifact of the diff's final newline) are not swallowed.
+	oldRem, newRem int
+}
+
+func (p *diffParser) flush() {
+	if p.cur != nil {
+		p.files = append(p.files, *p.cur)
+	}
+	p.cur = nil
+	p.hunk = nil
+}
+
+func (p *diffParser) newFile() *FileChange {
+	p.flush()
+	p.cur = &FileChange{Type: Modified}
+	return p.cur
+}
+
+// ensure returns the current file, starting one if none is open.
+func (p *diffParser) ensure() *FileChange {
+	if p.cur == nil {
+		return p.newFile()
+	}
+	return p.cur
+}
+
+func (p *diffParser) consume(line string) {
+	switch {
+	case p.header(line):
+	case p.hunkStart(line):
+	default:
+		p.body(line)
+	}
+}
+
+// header dispatches the file-level header lines; it returns false for anything
+// that is not a header so the caller can try the hunk and body handlers.
+func (p *diffParser) header(line string) bool {
+	return p.gitLine(line) ||
+		p.modeLine(line) ||
+		p.renameCopyLine(line) ||
+		p.binaryLine(line) ||
+		p.pathLine(line)
+}
+
+func (p *diffParser) gitLine(line string) bool {
+	if !strings.HasPrefix(line, "diff --git ") {
+		return false
+	}
+	f := p.newFile()
+	f.OldPath, f.NewPath = pathsFromGitHeader(line)
+	return true
+}
+
+func (p *diffParser) modeLine(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "new file mode "):
+		f := p.ensure()
+		f.Type = Added
+		f.NewMode = strings.TrimSpace(strings.TrimPrefix(line, "new file mode "))
+	case strings.HasPrefix(line, "deleted file mode "):
+		f := p.ensure()
+		f.Type = Deleted
+		f.OldMode = strings.TrimSpace(strings.TrimPrefix(line, "deleted file mode "))
+	case strings.HasPrefix(line, "old mode "):
+		p.ensure().OldMode = strings.TrimSpace(strings.TrimPrefix(line, "old mode "))
+	case strings.HasPrefix(line, "new mode "):
+		p.ensure().NewMode = strings.TrimSpace(strings.TrimPrefix(line, "new mode "))
+	default:
+		return false
+	}
+	return true
+}
+
+func (p *diffParser) renameCopyLine(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "rename from "):
+		f := p.ensure()
+		f.Type = Renamed
+		f.OldPath = unquotePath(strings.TrimPrefix(line, "rename from "))
+	case strings.HasPrefix(line, "rename to "):
+		f := p.ensure()
+		f.Type = Renamed
+		f.NewPath = unquotePath(strings.TrimPrefix(line, "rename to "))
+	case strings.HasPrefix(line, "copy from "):
+		f := p.ensure()
+		f.Type = Copied
+		f.OldPath = unquotePath(strings.TrimPrefix(line, "copy from "))
+	case strings.HasPrefix(line, "copy to "):
+		f := p.ensure()
+		f.Type = Copied
+		f.NewPath = unquotePath(strings.TrimPrefix(line, "copy to "))
+	default:
+		return false
+	}
+	return true
+}
+
+func (p *diffParser) binaryLine(line string) bool {
+	if strings.HasPrefix(line, "Binary files ") || strings.HasPrefix(line, "GIT binary patch") {
+		p.ensure().IsBinary = true
+		return true
+	}
+	return false
+}
+
+func (p *diffParser) pathLine(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "--- "):
+		// A new "---" while the current file already has hunks starts the next
+		// file (handles plain diffs with no "diff --git" header).
+		if p.cur == nil || len(p.cur.Hunks) > 0 {
+			p.newFile()
+		}
+		p.hunk = nil
+		path, devnull := diffPath(line, "--- ")
+		p.cur.OldPath = path
+		if devnull {
+			p.cur.Type = Added
+		}
+	case strings.HasPrefix(line, "+++ "):
+		f := p.ensure()
+		path, devnull := diffPath(line, "+++ ")
+		f.NewPath = path
+		if devnull {
+			f.Type = Deleted
+		}
+	default:
+		return false
+	}
+	return true
+}
+
+// hunkStart handles an "@@" header. It reports the line as consumed even when
+// the header does not parse, so junk that merely looks like a hunk header is
+// not mistaken for body content.
+func (p *diffParser) hunkStart(line string) bool {
+	if !strings.HasPrefix(line, "@@ ") {
+		return false
+	}
+	m := hunkRe.FindStringSubmatch(line)
+	if m == nil {
+		return true
+	}
+	f := p.ensure()
+	h := Hunk{
+		OldStart: atoi(m[1]),
+		OldLines: atoiDefault(m[2], 1),
+		NewStart: atoi(m[3]),
+		NewLines: atoiDefault(m[4], 1),
+		Section:  strings.TrimSpace(m[5]),
+	}
+	f.Hunks = append(f.Hunks, h)
+	p.hunk = &f.Hunks[len(f.Hunks)-1]
+	p.oldRem, p.newRem = h.OldLines, h.NewLines
+	return true
+}
+
+func (p *diffParser) body(line string) {
+	if p.hunk == nil || p.cur == nil {
+		return
+	}
+	// Once the declared line counts are exhausted the hunk is over; anything
+	// after it (a blank line, the next commit's text) is not part of the diff.
+	if p.oldRem <= 0 && p.newRem <= 0 {
+		p.hunk = nil
+		return
+	}
+	switch {
+	case strings.HasPrefix(line, "+"):
+		p.hunk.Lines = append(p.hunk.Lines, Line{Kind: Add, Text: line[1:]})
+		p.cur.Additions++
+		p.newRem--
+	case strings.HasPrefix(line, "-"):
+		p.hunk.Lines = append(p.hunk.Lines, Line{Kind: Delete, Text: line[1:]})
+		p.cur.Deletions++
+		p.oldRem--
+	case strings.HasPrefix(line, " "):
+		p.hunk.Lines = append(p.hunk.Lines, Line{Kind: Context, Text: line[1:]})
+		p.oldRem--
+		p.newRem--
+	case strings.HasPrefix(line, "\\"):
+		// "\ No newline at end of file" — not a content line.
+	case line == "":
+		// A blank line with its leading space stripped: still a context line
+		// while the hunk has lines left to consume.
+		p.hunk.Lines = append(p.hunk.Lines, Line{Kind: Context, Text: ""})
+		p.oldRem--
+		p.newRem--
+	}
 }
 
 // statOf computes a DiffStat over parsed file changes.
@@ -248,14 +322,6 @@ func statOf(files []FileChange) DiffStat {
 		s.Deletions += f.Deletions
 	}
 	return s
-}
-
-// ensure returns *curp, creating a file via mk if it is nil.
-func ensure(curp **FileChange, mk func() *FileChange) *FileChange {
-	if *curp == nil {
-		return mk()
-	}
-	return *curp
 }
 
 func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
