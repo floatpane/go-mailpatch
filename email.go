@@ -111,11 +111,14 @@ func parseSubject(subject string) (clean string, info SeriesInfo) {
 	return strings.TrimSpace(rest), info
 }
 
+var bracketGroupRe = regexp.MustCompile(`\[([^\]]*)\]`)
+
 // bracketTokens flattens "[RFC PATCH v2 1/3]" into its whitespace-separated
 // words across all leading bracket groups.
 func bracketTokens(brackets string) []string {
-	var toks []string
-	for _, group := range regexp.MustCompile(`\[([^\]]*)\]`).FindAllStringSubmatch(brackets, -1) {
+	groups := bracketGroupRe.FindAllStringSubmatch(brackets, -1)
+	toks := make([]string, 0, len(groups))
+	for _, group := range groups {
 		toks = append(toks, strings.Fields(group[1])...)
 	}
 	return toks

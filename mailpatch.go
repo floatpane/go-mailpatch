@@ -117,7 +117,7 @@ func Parse(r io.Reader) (*Patch, error) {
 	}
 	msg, err := mail.ReadMessage(r)
 	if err != nil {
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return nil, ErrEmpty
 		}
 		return nil, errors.Join(ErrMalformed, err)

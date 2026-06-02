@@ -32,6 +32,8 @@ func (c ChangeType) String() string {
 		return "renamed"
 	case Copied:
 		return "copied"
+	case Modified:
+		return "modified"
 	default:
 		return "modified"
 	}
@@ -249,7 +251,7 @@ func atoiDefault(s string, def int) int {
 // line. The "---"/"+++" lines override these when present, so this is a
 // fallback (it is also the only path source for pure-rename/mode diffs that
 // carry no hunks).
-func pathsFromGitHeader(line string) (old, new string) {
+func pathsFromGitHeader(line string) (oldPath, newPath string) {
 	rest := strings.TrimPrefix(line, "diff --git ")
 	// Common case: unquoted, no spaces in paths — "a/x b/y".
 	if !strings.HasPrefix(rest, "\"") {
