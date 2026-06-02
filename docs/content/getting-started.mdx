@@ -1,0 +1,93 @@
+---
+title: Getting Started
+---
+
+# Getting Started
+
+## Install
+
+```bash
+go get github.com/floatpane/go-mailpatch
+```
+
+Requires Go 1.26+. No other dependencies.
+
+## Your first parse
+
+Pipe a real patch straight from git:
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/floatpane/go-mailpatch"
+)
+
+func main() {
+	p, err := mailpatch.Parse(os.Stdin)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("%s <%s>\n", p.AuthorName, p.AuthorEmail)
+	fmt.Printf("Subject: %s\n", p.Subject)
+	if p.Series.Total > 0 {
+		fmt.Printf("Patch %d of %d (v%d)\n",
+			p.Series.Index, p.Series.Total, p.Series.Version)
+	}
+	for _, f := range p.Files {
+		fmt.Printf("  %-8s %s  +%d -%d\n",
+			f.Type, f.Path(), f.Additions, f.Deletions)
+	}
+}
+```
+
+```console
+$ git format-patch -1 --stdout | go run .
+Ada Lovelace <ada@example.com>
+Subject: parser: handle empty input
+Patch 2 of 3 (v1)
+  modified parser.go  +3 -0
+```
+
+## The three entry points
+
+| Function | Input | Returns |
+|----------|-------|---------|
+| `Parse` / `ParseBytes` | one email | a single `*Patch` |
+| `ParseMbox` | an mbox stream | `[]*Patch`, one per message, in file order |
+| `ParseSeries` | an mbox stream | a `*Series`: cover letter + ordered patches |
+| `ParseDiff` | a bare diff (no email) | `[]FileChange` |
+
+```go
+p, err := mailpatch.Parse(reader)          // single message
+p, err := mailpatch.ParseBytes(data)       // single message, in memory
+all, err := mailpatch.ParseMbox(reader)    // every message
+s, err := mailpatch.ParseSeries(reader)    // grouped into a series
+files, err := mailpatch.ParseDiff(text)    // just a diff
+```
+
+## Errors
+
+```go
+import "errors"
+
+p, err := mailpatch.ParseBytes(data)
+switch {
+case errors.Is(err, mailpatch.ErrEmpty):
+	// no message in the input
+case errors.Is(err, mailpatch.ErrMalformed):
+	// not a parseable RFC 5322 message
+case err != nil:
+	// other I/O error
+}
+```
+
+> [!NOTE]
+> A message with **no diff** — most often a `0/n` cover letter — is **not** an
+> error. It parses into a `Patch` whose `HasDiff()` is false and
+> `IsCoverLetter()` is true.
