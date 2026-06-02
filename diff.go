@@ -111,6 +111,10 @@ func ParseDiff(diff string) ([]FileChange, error) {
 		files []FileChange
 		cur   *FileChange
 		hunk  *Hunk
+		// Remaining old/new lines declared by the current hunk's "@@" header.
+		// They bound the hunk body, so trailing blank lines (e.g. the artifact
+		// of the diff's final newline) are not swallowed as context.
+		oldRem, newRem int
 	)
 	flush := func() {
 		if cur != nil {
@@ -194,25 +198,41 @@ func ParseDiff(diff string) ([]FileChange, error) {
 				}
 				f.Hunks = append(f.Hunks, h)
 				hunk = &f.Hunks[len(f.Hunks)-1]
+				oldRem, newRem = h.OldLines, h.NewLines
 			}
 
 		default:
 			if hunk == nil || cur == nil {
 				continue
 			}
+			// Once the declared line counts are exhausted the hunk is over;
+			// anything after it (a blank line, the next commit's text) is not
+			// part of the diff.
+			if oldRem <= 0 && newRem <= 0 {
+				hunk = nil
+				continue
+			}
 			switch {
 			case strings.HasPrefix(line, "+"):
 				hunk.Lines = append(hunk.Lines, Line{Kind: Add, Text: line[1:]})
 				cur.Additions++
+				newRem--
 			case strings.HasPrefix(line, "-"):
 				hunk.Lines = append(hunk.Lines, Line{Kind: Delete, Text: line[1:]})
 				cur.Deletions++
+				oldRem--
 			case strings.HasPrefix(line, " "):
 				hunk.Lines = append(hunk.Lines, Line{Kind: Context, Text: line[1:]})
+				oldRem--
+				newRem--
 			case strings.HasPrefix(line, "\\"):
 				// "\ No newline at end of file" — not a content line.
 			case line == "":
+				// A blank line with its leading space stripped: still a
+				// context line while the hunk has lines left to consume.
 				hunk.Lines = append(hunk.Lines, Line{Kind: Context, Text: ""})
+				oldRem--
+				newRem--
 			}
 		}
 	}
